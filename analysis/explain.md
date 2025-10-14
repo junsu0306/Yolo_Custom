@@ -335,3 +335,82 @@
   3. 두 과정이 동시에: 학습하면서 압축됨
 
   궁금한 부분이 있으면 물어보세요!
+
+
+
+  8.pruning
+   코드에서 적용한 pruning 방식을 분석하면:
+
+  Structured Filter Pruning (구조적 필터 프루닝)
+
+  이 프로젝트는 L2-norm 기반 구조적 필터 프루닝을 사용합니다.
+
+  핵심 특징:
+
+  1. Filter-level Pruning (필터 단위 프루닝)
+
+  - common.py:15-18: 개별 weight가 아닌 필터 전체를 0으로 만듦
+  - Unstructured pruning(개별 weight 제거)이 아닌 Structured pruning
+
+  2. L2 Norm 기반 중요도 측정
+
+  common.py:33-40에서 핵심 로직:
+  def get_filter_pruning_idx(layer, sparsity):
+      weight = layer.weight
+      num_filters = weight.shape[0]
+      num_pruning_filters = int(num_filters * sparsity)
+
+      # L2 norm으로 각 필터의 중요도 계산
+      filter_norms = torch.norm(weight.view(num_filters, -1), dim=1)
+
+      # 가장 작은 norm을 가진 필터들을 제거 대상으로 선택
+      _, pruning_idx = torch.topk(filter_norms, num_pruning_filters,
+  largest=False)
+      return pruning_idx
+
+  작동 원리:
+  - 각 필터의 weight를 1D로 펼침
+  - L2 norm (유클리드 거리) 계산: √(w₁² + w₂² + ... + wₙ²)
+  - norm이 작을수록 = 덜 중요한 필터로 판단
+  - largest=False로 가장 작은 norm 필터들을 선택
+
+  3. Magnitude-based Pruning
+
+  - 가중치의 크기(magnitude)를 기준으로 중요도 판단
+  - 다른 기준들:
+    - ❌ Gradient-based (학습 중 gradient 크기)
+    - ❌ Activation-based (출력 activation 크기)
+    - ❌ Hessian-based (2차 미분 정보)
+    - ✅ Magnitude-based (가중치 L2 norm)
+
+  4. One-shot Pruning
+
+  - compression.py:7-49: 전체 모델을 한 번에 pruning
+  - Iterative pruning(점진적 제거)이 아닌 일괄 pruning
+  - Fine-tuning 없이 바로 적용
+
+  정리:
+
+  이 방식은 **"L2-norm based One-shot Structured Filter Pruning"**입니다:
+
+  | 분류 기준             | 적용된 방식                    | 설명
+             |
+  |-------------------|---------------------------|-------------------------
+  |
+  | Granularity       | Structured (Filter-level) | 필터 전체 제거
+        |
+  | Importance Metric | Magnitude (L2 norm)       | 가중치 크기 기반
+         |
+  | Pruning Schedule  | One-shot                  | 한 번에 일괄 적용
+         |
+  | Layer Selection   | Global Sparsity           | 모든 레이어에 동일한
+  sparsity 적용 |
+
+  장점:
+  - 구현 간단
+  - HW 가속 용이 (실제 메모리/연산량 감소)
+  - 추가 학습 없이 빠른 압축
+
+  단점:
+  - Layer별 중요도 차이 무시
+  - Fine-tuning 없어 정확도 하락 가능
