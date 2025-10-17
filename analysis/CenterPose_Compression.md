@@ -19,6 +19,13 @@ CenterPose src custom/
 ├── **memmory_comparison.txt**             # 메모리 비교 결과 저장
 │
 └── lib/
+    ├── trains/
+    │   └── **base_trainer.py**            # 학습 루프에 압축 통합
+    │       ├── dlasg_blockwise_pruning() 호출 (line 114)
+    │       ├── measure_model_memory()   # Pruning 전 메모리 측정
+    │       ├── measure_pruned_layer_memory() # Reducing 후 메모리 측정
+    │       └── custom_memory_loss_function() # 메모리 기반 loss 추가
+    │
     └── pruning/
         ├── **dlasg_pruning.py**           # Pruning 핵심 구현
         │   ├── filter_pruning()        # Conv 필터 pruning
@@ -31,7 +38,9 @@ CenterPose src custom/
         └── **memory_usage.py**            # 메모리 프로파일링
             ├── measure_memory()        # 레이어별 메모리 측정
             ├── extract_layers()        # 모델 레이어 추출
-            └── measure_model_memory()  # 전체 메모리 측정
+            ├── measure_model_memory()  # 전체 메모리 측정
+            ├── measure_pruned_layer_memory() # Pruned 레이어 메모리
+            └── custom_memory_loss_function() # 메모리 loss 계산
 ```
 
 ## 기능별 구현 코드
@@ -167,6 +176,88 @@ def measure_memory(x, layers, device):
 - Upsampling layers (dla_up, ida_up)
 - ConvGRU
 - Detection heads (hm, wh, reg, hps, scale 등)
+
+### 5. Base Trainer 통합 최적화
+
+**목적**: 학습 중 자동으로 pruning 및 메모리 최적화 수행
+
+**핵심 파일**: `lib/trains/base_trainer.py:106-140`
+
+```python
+# Training phase에서 backprop 후 최적화 적용
+if phase == 'train':
+    self.optimizer.zero_grad()
+    loss.backward()
+
+    # 1. 모델 추출 (DataParallel 고려)
+    if isinstance(model_with_loss, torch.nn.DataParallel):
+        model_for_pruning = model_with_loss.module.model.to(opt.device)
+    else:
+        model_for_pruning = model_with_loss.model.to(opt.device)
+
+    # 2. Blockwise Pruning 수행 (sparsity=0.5)
+    dlasg_blockwise_pruning(model_for_pruning, sparsity=0.5, device=opt.device)
+
+    # 3. Pruning 전 메모리 측정 (최초 1회만)
+    if self.file_stream is not None:
+        _ = measure_model_memory(model_for_pruning, self.dummy_input,
+                                 opt.device, self.file_stream)
+
+    # 4. Reducing 후 메모리 측정
+    mem_usg = measure_pruned_layer_memory(model_for_pruning, self.dummy_input,
+                                          opt.device, self.file_stream)
+
+    # 5. 메모리 기반 loss 추가
+    hyperparam = 1.0
+    device_condition_memory = 1.0  # MB 단위
+    loss += custom_memory_loss_function(mem_usg, hyperparam,
+                                        device_condition_memory)
+
+    # 6. Gradient clipping 및 optimizer step
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 100.)
+    self.optimizer.step()
+```
+
+**특징**:
+- **Training-time Pruning**: 매 iteration마다 자동 pruning 수행
+- **메모리 제약 loss**: 메모리 사용량을 loss에 반영하여 최적화
+- **DataParallel 호환**: 멀티 GPU 환경에서도 동작
+- **Gradient Clipping**: 안정적인 학습을 위한 gradient norm 제한
+
+### 6. Demo 수정 (압축 모델 추론)
+
+**목적**: Reduced 모델을 사용한 실시간 추론 지원
+
+**핵심 파일**: `reduced_demo.py`
+
+```python
+# 기존 demo.py와 동일한 인터페이스, 압축 모델 로드
+if __name__ == '__main__':
+    opt = opts().parser.parse_args()
+
+    # 압축 모델 로드 (reduced_model_50.pth 등)
+    opt.load_model = "../models/reduced_model_50.pth"
+
+    # 나머지는 demo.py와 동일
+    opt.nms = True
+    opt.obj_scale = True
+
+    # Tracking 설정
+    if opt.tracking_task == True:
+        opt.pre_img = True
+        opt.pre_hm = True
+        opt.tracking = True
+        # ... (tracking 관련 설정)
+
+    # 추론 실행
+    demo(opt, meta)
+```
+
+**변경 사항**:
+- 압축된 모델(.pth) 로드 지원
+- 기존 demo.py와 동일한 인터페이스 유지
+- 실시간 비디오/이미지 추론 가능
+- PnP 알고리즘 및 Tracking 지원
 
 ## 전체 Compression Flow
 
@@ -419,6 +510,19 @@ python reducing.py
 ```bash
 python pruning_TW.py
 # Output: 레이어별 메모리 사용량 출력
+```
+
+### 4. 압축 모델 Demo 실행
+```bash
+python reduced_demo.py --load_model ../models/reduced_model_50.pth
+# Output: 압축 모델 기반 실시간 추론
+```
+
+### 5. Training-time 자동 압축
+```bash
+# base_trainer.py가 자동으로 압축 수행
+python main.py --task objectpose --exp_id compression_exp
+# 매 iteration마다 자동 pruning + 메모리 최적화
 ```
 
 ## YOLO vs CenterPose 비교
