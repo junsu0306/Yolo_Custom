@@ -23,7 +23,8 @@ On_Device_AI/
 │
 ├── ultralytics_custom/          # YOLO 원본 통합용 (trainer 등)
 ├── CenterPose src custom/       # CenterPose 원본 통합용
-└── analysis/                    # 기술 분석 문서
+├── analysis/                    # 기술 분석 문서
+└── requirements.txt             # 필수 패키지
 ```
 
 ---
@@ -292,7 +293,7 @@ git clone <this-repo>
 cd On_Device_AI
 
 # 필수 패키지 설치
-pip install torch torchvision
+pip install -r requirements.txt
 ```
 
 ---

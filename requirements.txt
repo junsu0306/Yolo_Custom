@@ -1,0 +1,13 @@
+# On-Device AI Model Compression
+# 필수 패키지
+
+torch>=2.0.0
+torchvision>=0.15.0
+numpy>=1.21.0
+
+# YOLOv8 압축용
+ultralytics>=8.0.0
+
+# CenterPose 압축용 (선택 - Linux+CUDA 환경 필요)
+# opencv-python>=4.5.0
+# pycocotools>=2.0.0
