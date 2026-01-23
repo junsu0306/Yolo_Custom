@@ -10,10 +10,6 @@
 
 ```
 On_Device_AI/
-├── notebooks/                   # Colab 데모 노트북
-│   ├── yolo_compression_demo.ipynb
-│   └── centerpose_compression_demo.ipynb
-│
 ├── yolo_utils/                  # YOLOv8 압축 핵심 코드
 │   ├── pruning.py               # L2-norm Pruning
 │   ├── reducing.py              # Channel Reducing
@@ -27,6 +23,7 @@ On_Device_AI/
 │
 ├── ultralytics_custom/          # YOLO 원본 통합용 (trainer 등)
 ├── CenterPose src custom/       # CenterPose 원본 통합용
+└── analysis/                    # 기술 분석 문서
 ```
 
 ---
@@ -287,16 +284,35 @@ def custom_memory_loss_function(memory, hyperparam, target_memory):
 
 ## 빠른 시작
 
+### 환경 설정
+
+```bash
+# 프로젝트 클론
+git clone <this-repo>
+cd On_Device_AI
+
+# 필수 패키지 설치
+pip install torch torchvision
+```
+
+---
+
 ### YOLOv8 압축
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](notebooks/yolo_compression_demo.ipynb)
+#### Step 1: Ultralytics 설치
+
+```bash
+pip install ultralytics
+```
+
+#### Step 2: 압축 실행
 
 ```python
 from yolo_utils import yolov8_pruning, yolov8_reducing
 from ultralytics import YOLO
 import torch
 
-# 1. 모델 로드
+# 1. 모델 로드 (자동 다운로드)
 model = YOLO('yolov8n.pt')
 print(f"Original: {sum(p.numel() for p in model.model.parameters()):,} params")
 
@@ -312,22 +328,62 @@ print(f"Reduced: {sum(p.numel() for p in reduced_model.model.parameters()):,} pa
 torch.save(reduced_model.model.state_dict(), 'compressed_yolov8n.pt')
 ```
 
-### CenterPose 압축
-
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](notebooks/centerpose_compression_demo.ipynb)
+#### Step 3: 추론 테스트
 
 ```python
+# 압축된 모델로 추론
+results = reduced_model.predict('https://ultralytics.com/images/bus.jpg')
+print(f"Detected {len(results[0].boxes)} objects")
+```
+
+---
+
+### CenterPose 압축
+
+#### Step 1: CenterPose 환경 설정
+
+```bash
+# CenterPose 원본 레포 클론
+git clone https://github.com/NVlabs/CenterPose.git
+cd CenterPose
+pip install -r requirements.txt
+
+# DCNv2 빌드 (필요한 경우)
+cd src/lib/models/networks/DCNv2
+python setup.py build develop
+cd ../../../../..
+```
+
+#### Step 2: 사전 학습 모델 다운로드
+
+```bash
+# CenterPose 공식 모델 다운로드 (예: shoe 카테고리)
+# https://github.com/NVlabs/CenterPose#pretrained-models 참조
+wget <pretrained_model_url> -O pretrained_shoe.pth
+```
+
+#### Step 3: 압축 실행
+
+```python
+import sys
+sys.path.append('CenterPose/src')
+
 from centerpose_utils import dlasg_blockwise_pruning, reduce_pruned_model
+from lib.models.model import create_model, load_model
 import torch
 
-# 1. 모델 로드
-model = load_model(...)  # CenterPose 환경 필요
+# 1. 모델 생성 및 로드
+heads = {'hm': 1, 'wh': 2, 'reg': 2}
+model = create_model('dla_34', heads, head_conv=256)
+model = load_model(model, 'pretrained_shoe.pth')
+print(f"Original: {sum(p.numel() for p in model.parameters()):,} params")
 
 # 2. Pruning (30% 필터 제거)
 pruned_model = dlasg_blockwise_pruning(model, sparsity=0.3)
 
 # 3. Reducing (물리적 채널 제거)
 reduced_model = reduce_pruned_model(pruned_model)
+print(f"Reduced: {sum(p.numel() for p in reduced_model.parameters()):,} params")
 
 # 4. 저장
 torch.save(reduced_model, 'compressed_centerpose.pth')

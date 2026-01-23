@@ -8,7 +8,13 @@ YOLOv8 모델에 대한 **Knowledge Distillation + Structured Pruning** 기반 �
 
 **권장**: `yolo_utils` 모듈을 사용하면 간편하게 압축을 적용할 수 있습니다.
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](../notebooks/yolo_compression_demo.ipynb)
+### 환경 설정
+
+```bash
+pip install ultralytics torch torchvision
+```
+
+### 압축 실행
 
 ```python
 from yolo_utils import yolov8_pruning, yolov8_reducing
@@ -159,4 +165,4 @@ kd_loss = (loss_cls + loss_bbox) * distill_ratio
 ## 관련 파일
 
 - [yolo_utils/](../yolo_utils/) - 간편 사용 유틸리티
-- [Demo 노트북](../notebooks/yolo_compression_demo.ipynb)
+- [메인 README](../README.md) - 전체 압축 과정 설명

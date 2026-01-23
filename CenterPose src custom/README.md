@@ -8,7 +8,19 @@ DLA-34 기반 CenterPose 6D Pose Estimation 모델에 대한 **Structured Prunin
 
 **권장**: `centerpose_utils` 모듈을 사용하면 간편하게 압축을 적용할 수 있습니다.
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](../notebooks/centerpose_compression_demo.ipynb)
+### 환경 설정
+
+```bash
+# CenterPose 원본 레포 클론
+git clone https://github.com/NVlabs/CenterPose.git
+cd CenterPose && pip install -r requirements.txt
+
+# DCNv2 빌드 (필요한 경우)
+cd src/lib/models/networks/DCNv2
+python setup.py build develop
+```
+
+### 압축 실행
 
 ```python
 from centerpose_utils import dlasg_blockwise_pruning, reduce_pruned_model
@@ -219,5 +231,5 @@ python reduced_demo.py \
 ## 관련 파일
 
 - [centerpose_utils/](../centerpose_utils/) - 간편 사용 유틸리티
-- [Demo 노트북](../notebooks/centerpose_compression_demo.ipynb)
+- [메인 README](../README.md) - 전체 압축 과정 설명
 - [CenterPose 원본](https://github.com/NVlabs/CenterPose)
