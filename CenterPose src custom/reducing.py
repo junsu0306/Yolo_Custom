@@ -1,75 +1,47 @@
+"""
+CenterPose Reducing Script
+
+Pruning된 모델에서 0으로 마스킹된 필터를 물리적으로 제거하여
+실제 모델 크기를 줄입니다.
+
+출력: 물리적으로 축소된 모델 (.pth)
+"""
+
 import torch
 import os
+import time
 from lib.models.model import create_model, load_model
 from lib.opts import opts
-from dlasg_reducing import get_survived_filter_idx, conv_reduce, bn_reduce, copy_layer, bn_copy_layer
-import time
 from lib.datasets.dataset_combined import ObjectPoseDataset
-from lib.pruning.dlasg_pruning import dlasg_blockwise_pruning , reduce_pruned_model
-
-# def reduce_dla_model(model):
-#     from torch import nn
-#     import copy
-
-#     # 모델 복제
-#     reduced_model = copy.deepcopy(model)
-
-#     # 기존 모델 레이어 순회
-#     for name, layer in model.named_modules():
-#         if isinstance(layer, nn.Conv2d):
-#             survived_out = get_survived_filter_idx(layer)
-#             survived_in = torch.arange(layer.weight.shape[1])
-
-#             reduced_conv = nn.Conv2d(
-#                 in_channels=len(survived_in),
-#                 out_channels=len(survived_out),
-#                 kernel_size=layer.kernel_size,
-#                 stride=layer.stride,
-#                 padding=layer.padding,
-#                 dilation=layer.dilation,
-#                 groups=layer.groups,
-#                 bias=(layer.bias is not None)
-#             )
-#             conv_reduce(layer, reduced_conv, survived_out, survived_in)
-
-#             set_module_by_name(reduced_model, name, reduced_conv)
-
-#         elif isinstance(layer, nn.BatchNorm2d):
-#             survived_idx = get_survived_filter_idx(layer)
-
-#             reduced_bn = nn.BatchNorm2d(len(survived_idx))
-#             bn_reduce(layer, reduced_bn, survived_idx)
-
-#             set_module_by_name(reduced_model, name, reduced_bn)
-
-#     return reduced_model
-
-
-
-
-# def set_module_by_name(model, name, new_module):
-#     names = name.split('.')
-#     submod = model
-#     for n in names[:-1]:
-#         submod = getattr(submod, n)
-#     setattr(submod, names[-1], new_module)
+from lib.pruning.dlasg_pruning import dlasg_blockwise_pruning, reduce_pruned_model
 
 
 def load_and_reduce_model(model_path, sparsity):
+    """
+    모델을 로드하고 pruning + reducing을 적용합니다.
+
+    Args:
+        model_path: 사전 학습된 모델 경로
+        sparsity: 제거할 필터 비율 (0.0 ~ 1.0)
+
+    Returns:
+        reduced_model: 물리적으로 축소된 모델
+    """
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"Model file {model_path} not found.")
 
     opt = opts()
     opt = opt.parser.parse_args()
 
-    # Local configuration
-    opt.c = 'shoe'
-    opt.arch='dla_34'
+    # ========== 모델 설정 (필요시 수정) ==========
+    opt.c = 'shoe'  # 카테고리: shoe, chair, cup, camera, bike, book, bottle, etc.
+    opt.arch = 'dla_34'
     opt.obj_scale = True
     opt.obj_scale_weight = 1
     opt.mug = False
+    # ============================================
 
-    # Training param
+    # 학습 파라미터 설정
     opt.tracking_task = True
     opt.exp_id = f'objectron_{opt.c}_{opt.arch}'
     opt.num_epochs = 15
@@ -83,11 +55,10 @@ def load_and_reduce_model(model_path, sparsity):
     opt.debug = 5
     opt.save_all = True
 
-    # Tracking related
-    if opt.tracking_task == True:
-
-        if opt.c == 'chair' or opt.c == 'bike':
-            opt.rotate = 15  # degree
+    # Tracking 관련 설정
+    if opt.tracking_task:
+        if opt.c in ['chair', 'bike']:
+            opt.rotate = 15
         else:
             opt.rotate = 60
 
@@ -108,13 +79,12 @@ def load_and_reduce_model(model_path, sparsity):
         opt.shift = 0.05
         opt.scale = 0.05
 
-        # For hm
+        # Heatmap 설정
         opt.hm_heat_random = True
         opt.hm_disturb = 0.05
         opt.lost_disturb = 0.2
         opt.fp_disturb = 0.1
 
-        # For hm_hp
         opt.hm_hp_heat_random = True
         opt.hm_hp_disturb = 0.03
         opt.hp_lost_disturb = 0.1
@@ -122,23 +92,19 @@ def load_and_reduce_model(model_path, sparsity):
 
         opt.max_frame_dist = 3
 
-        # Currently, CenterPose mode does not support symmetrical objects
+        # 대칭 객체 처리
         if opt.c in ['bottle', 'chair', 'cup']:
             opt.data_generation_mode_ratio = 0
         else:
             opt.data_generation_mode_ratio = 0.3
 
         print('Running tracking')
-
         opt.vis_thresh = max(opt.track_thresh, opt.vis_thresh)
         opt.pre_thresh = max(opt.track_thresh, opt.pre_thresh)
         opt.new_thresh = max(opt.track_thresh, opt.new_thresh)
-        print('Using tracking threshold for out threshold!', opt.track_thresh)
+        print(f'Using tracking threshold: {opt.track_thresh}')
 
-    # # To continue
-    # opt.resume = True
-    # opt.load_model = ""
-
+    # 옵션 파싱
     opt.gpus_str = opt.gpus
     opt.gpus = [int(gpu) for gpu in opt.gpus.split(',')]
     opt.gpus = [i for i in range(len(opt.gpus))] if opt.gpus[0] >= 0 else [-1]
@@ -152,7 +118,7 @@ def load_and_reduce_model(model_path, sparsity):
     opt.hm_hp = not opt.not_hm_hp
     opt.reg_hp_offset = (not opt.not_reg_hp_offset) and opt.hm_hp
 
-    if opt.head_conv == -1:  # init default head_conv
+    if opt.head_conv == -1:
         opt.head_conv = 256 if 'dla' in opt.arch else 64
     opt.pad = 127 if 'hourglass' in opt.arch else 31
     opt.num_stacks = 2 if opt.arch == 'hourglass' else 1
@@ -162,14 +128,14 @@ def load_and_reduce_model(model_path, sparsity):
 
     if opt.master_batch_size == -1:
         opt.master_batch_size = opt.batch_size // len(opt.gpus)
-    rest_batch_size = (opt.batch_size - opt.master_batch_size)
+    rest_batch_size = opt.batch_size - opt.master_batch_size
     opt.chunk_sizes = [opt.master_batch_size]
     for i in range(len(opt.gpus) - 1):
         slave_chunk_size = rest_batch_size // (len(opt.gpus) - 1)
         if i < rest_batch_size % (len(opt.gpus) - 1):
             slave_chunk_size += 1
         opt.chunk_sizes.append(slave_chunk_size)
-    print('training chunk_sizes:', opt.chunk_sizes)
+    print(f'Training chunk_sizes: {opt.chunk_sizes}')
 
     opt.root_dir = os.path.join(os.path.dirname(__file__), '..')
     opt.data_dir = os.path.join(opt.root_dir, 'data')
@@ -179,72 +145,66 @@ def load_and_reduce_model(model_path, sparsity):
     opt.save_dir = os.path.join(opt.exp_dir, f'{opt.exp_id}_{time_str}')
     opt.debug_dir = os.path.join(opt.save_dir, 'debug')
 
-
     Dataset = ObjectPoseDataset
     opt = opts().update_dataset_info_and_set_heads(opt, Dataset)
+
+    # 모델 생성 및 로드
     print("Creating model...")
-
-
     model = create_model(opt.arch, opt.heads, opt.head_conv, opt=opt)
 
     print(f"Loading model weights from {model_path}...")
-
-
     model = load_model(model, model_path)
-
-
     model = model.to("cuda:0")
 
-    dlasg_blockwise_pruning(model, sparsity=0.5, device = 'cuda:0')
+    # Pruning 적용
+    print(f"Applying pruning with sparsity {sparsity}...")
+    dlasg_blockwise_pruning(model, sparsity=sparsity, device='cuda:0')
 
-    total_zero = 0
+    # Pruning 결과 확인
     total_params = sum(p.numel() for p in model.parameters())
+    total_zero = 0
     with torch.no_grad():
         for p in model.parameters():
-            # 정확히 0인 요소 개수
-            z = (p == 0).sum().item() 
-            total_zero += z
+            total_zero += (p == 0).sum().item()
 
-    print(f"Total parameters: {total_params}")
-    print(f"zero parameters: {total_zero}")
+    print(f"Total parameters: {total_params:,}")
+    print(f"Zero parameters: {total_zero:,}")
+    print(f"Sparsity: {total_zero / total_params * 100:.1f}%")
 
-    print(f"Reducing model with pruning threshold...")
-
-
-
+    # Reducing 적용
+    print("Reducing model (removing zero filters)...")
     reduced_model = reduce_pruned_model(model)
-   
+
+    # 체크포인트에서 epoch 정보 추출
     checkpoint = torch.load(model_path, map_location='cpu')
-    epoch = checkpoint['epoch'] if 'epoch' in checkpoint else 0
+    epoch = checkpoint.get('epoch', 0)
 
-    model_filename = f"reduced_model_{int(sparsity * 100)}_book.pth"
-
-    #torch.save({'epoch': epoch, 'state_dict': reduced_model.state_dict()}, model_filename)
+    # 축소된 모델 저장
+    model_filename = f"reduced_model_{int(sparsity * 100)}_{opt.c}.pth"
     torch.save(reduced_model, model_filename)
-
-
-    print(f"Reduced model weights saved as {model_filename} (epoch {epoch})")
+    print(f"Reduced model saved as {model_filename} (epoch {epoch})")
 
     return reduced_model
 
 
-
-
-
-
 if __name__ == "__main__":
+    # ========== 설정 ==========
     os.environ["CUDA_VISIBLE_DEVICES"] = '0'
+
+    # 본인의 모델 경로로 수정하세요
     model_path = "../exp/object_pose/objectron_book_dla_34_2025-09-02-05-43/book_last.pth"
-    sparsity = 0.50
+    sparsity = 0.50  # 50% 필터 제거
+    # ==========================
+
     reduced_model = load_and_reduce_model(model_path, sparsity)
 
-    total_zero = 0
+    # 최종 결과 확인
     total_params = sum(p.numel() for p in reduced_model.parameters())
+    total_zero = 0
     with torch.no_grad():
         for p in reduced_model.parameters():
-            # 정확히 0인 요소 개수
-            z = (p == 0).sum().item()
-            total_zero += z
+            total_zero += (p == 0).sum().item()
 
-    print(f"After reduece Total parameters: {total_params}")
-    print(f"After reduece zero parameters: {total_zero}")
+    print(f"\n===== Final Results =====")
+    print(f"Total parameters: {total_params:,}")
+    print(f"Zero parameters: {total_zero:,}")

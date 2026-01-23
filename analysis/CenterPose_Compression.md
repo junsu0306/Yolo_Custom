@@ -1,280 +1,163 @@
-# CenterPose Compression 상세 문서
+## CenterPose 압축 개요
 
-## 개요
-
-CenterPose 6D Pose Estimation 모델 압축 프로젝트로, DLA-34 백본에 대한 **One-shot Structured Pruning**과 **Channel Reduction** 기법을 구현합니다.
-
-### 핵심 기술
-
-| 기법 | 설명 |
-|------|------|
-| **Pruning** | L2-norm 기반 One-shot Structured Pruning |
-| **타겟 모듈** | DLA-34의 BasicBlock 단위 Blockwise Pruning |
-| **Reducing** | 물리적 채널 제거를 통한 실제 모델 경량화 |
-| **Memory Loss** | 학습 중 메모리 사용량 기반 최적화 |
-
-### 모델 구조
-
-```
-CenterPose (DLA-34 기반)
-├── Base Network: DLA-34 (~20M params)
-│   └── BasicBlock × 여러 개 (Pruning 대상)
-├── Upsampling: DLA-Up, IDA-Up
-├── ConvGRU: Temporal processing
-└── Detection Heads: hm, wh, reg, hps, scale 등
-```
-
----
+1. L2-norm based One-shot Structured Pruning 기법 사용
+2. Pruning: BasicBlock 단위 Blockwise Pruning 적용
+3. Reducing: 물리적 채널 제거를 통한 모델 경량화
+4. DLA-34 백본 기반 6D Pose Estimation 모델 압축
 
 ## 수정 및 추가된 파일 목록
 
-```
+```markdown
 CenterPose src custom/
-├── pruning.py                       # 메인 Pruning 실행 스크립트
-├── reducing.py                      # 메인 Reducing 실행 스크립트
-├── pruning_TW.py                    # 메모리 측정 포함 Pruning
-├── dlasg_pruning.py                 # DLA 모델 전용 Pruning 함수
-├── dlasg_reducing.py                # DLA 모델 전용 Reducing 함수
-├── memory_usage.py                  # 레이어별 메모리 측정 도구
-├── reduced_demo.py                  # 압축 모델 Demo 실행
-├── memmory_comparison.txt           # 메모리 비교 결과
+├── **pruning.py**                         # 메인 pruning 실행 스크립트
+├── **reducing.py**                        # 메인 reducing 실행 스크립트
+├── **pruning_TW.py**                      # 메모리 측정 포함 pruning 스크립트
+├── **dlasg_pruning.py**                   # DLA 모델 전용 pruning 함수
+├── **dlasg_reducing.py**                  # DLA 모델 전용 reducing 함수
+├── **memory_usage.py**                    # 레이어별 메모리 측정 도구
+├── **reduced_demo.py**                    # 압축 모델 데모 실행
+├── **memmory_comparison.txt**             # 메모리 비교 결과 저장
 │
 └── lib/
     ├── trains/
-    │   └── base_trainer.py          # 학습 루프에 압축 통합
-    │       ├── dlasg_blockwise_pruning() 호출
-    │       ├── measure_model_memory()
-    │       ├── measure_pruned_layer_memory()
-    │       └── custom_memory_loss_function()
+    │   └── **base_trainer.py**            # 학습 루프에 압축 통합
+    │       ├── dlasg_blockwise_pruning() 호출 (line 114)
+    │       ├── measure_model_memory()   # Pruning 전 메모리 측정
+    │       ├── measure_pruned_layer_memory() # Reducing 후 메모리 측정
+    │       └── custom_memory_loss_function() # 메모리 기반 loss 추가
     │
     └── pruning/
-        ├── dlasg_pruning.py         # Pruning 핵심 구현
-        │   ├── filter_pruning()
-        │   ├── bn_pruning()
-        │   ├── get_filter_norms()
-        │   ├── get_pruning_indices()
-        │   ├── dlasg_blockwise_pruning()
-        │   └── reduce_pruned_model()
+        ├── **dlasg_pruning.py**           # Pruning 핵심 구현
+        │   ├── filter_pruning()        # Conv 필터 pruning
+        │   ├── bn_pruning()            # BatchNorm pruning
+        │   ├── get_filter_norms()      # L2 norm 계산
+        │   ├── get_pruning_indices()   # Global pruning index 계산
+        │   ├── dlasg_blockwise_pruning() # BasicBlock 단위 pruning
+        │   └── reduce_pruned_model()   # Pruned 모델 reducing
         │
-        └── memory_usage.py          # 메모리 프로파일링
-            ├── measure_memory()
-            ├── extract_layers()
-            ├── measure_model_memory()
-            ├── measure_pruned_layer_memory()
-            └── custom_memory_loss_function()
+        └── **memory_usage.py**            # 메모리 프로파일링
+            ├── measure_memory()        # 레이어별 메모리 측정
+            ├── extract_layers()        # 모델 레이어 추출
+            ├── measure_model_memory()  # 전체 메모리 측정
+            ├── measure_pruned_layer_memory() # Pruned 레이어 메모리
+            └── custom_memory_loss_function() # 메모리 loss 계산
 ```
 
----
+## 기능별 구현 코드
 
-## Pruning 알고리즘
+### 1. Structured Pruning (L2 Norm 기반)
 
-### 1. L2 Norm 기반 필터 선택
-
-**목적**: Conv 필터의 중요도를 L2 norm으로 측정하여 Pruning 대상 선정
+**목적**: Conv 필터의 중요도를 L2 norm으로 측정하여 pruning 대상 선정
 
 **핵심 함수**: `lib/pruning/dlasg_pruning.py`
 
 ```python
+# L2 Norm 계산 (최대값 보호)
 def get_filter_norms(layer, inf=99999):
-    """L2 Norm 계산 (최대값 보호)"""
-    # 각 필터의 L2 norm 계산
-    filter_norms = torch.norm(
-        layer.weight.view(layer.weight.shape[0], -1),
-        dim=1
-    )
-
-    # 최대 norm 필터는 Pruning 방지 (inf로 설정)
+    filter_norms = torch.norm(layer.weight.view(layer.weight.shape[0], -1), dim=1)
     max_idx = torch.argmax(filter_norms)
-    filter_norms[max_idx] = inf
-
+    filter_norms[max_idx] = inf  # 최대값은 pruning 방지
     return filter_norms
-```
 
-### 2. Global Sparsity 기반 Pruning Index 계산
-
-```python
+# Global Pruning Index 계산
 def get_pruning_indices(filter_norms, sparsity):
-    """전체 레이어를 고려한 Global Pruning"""
-    # 모든 레이어의 norm 합치기
     all_norms = torch.cat(filter_norms)
-
-    # 전체에서 sparsity 비율만큼 선택
     num_pruning_filters = int(all_norms.numel() * sparsity)
-
-    # 가장 작은 norm을 가진 필터들 선택
-    _, global_pruning_idx = torch.topk(
-        all_norms,
-        num_pruning_filters,
-        largest=False  # 작은 값부터
-    )
-
-    # 각 레이어별 local index로 변환
-    return convert_to_local_indices(global_pruning_idx)
+    _, global_pruning_idx = torch.topk(all_norms, num_pruning_filters, largest=False)
+    # 각 레이어별로 local index 변환
+    ...
+    return pruning_indices
 ```
 
 **특징**:
-- **Global Sparsity**: 전체 레이어를 통합 고려
-- **최대 Norm 보호**: 가장 중요한 필터는 항상 보존
-- **Top-k Smallest**: 가장 작은 norm 필터 선택
+- Global sparsity 기준으로 전체 레이어를 고려한 pruning
+- 최대 norm 필터는 항상 보존 (inf 설정)
+- Top-k smallest norm 선택
 
----
+### 2. BasicBlock Blockwise Pruning
 
-## BasicBlock Blockwise Pruning
+**목적**: DLA-34의 BasicBlock 단위로 구조화된 pruning 적용
 
-### DLA-34 BasicBlock 구조
-
-```
-BasicBlock
-├── conv1: 3×3 Conv (Pruning 대상)
-├── bn1: BatchNorm
-├── relu
-├── conv2: 3×3 Conv (입력 채널 조정)
-└── bn2: BatchNorm
-    ↓
-(+ residual connection)
-```
-
-### Blockwise Pruning 구현
-
-**핵심 함수**: `dlasg_blockwise_pruning()` in `lib/pruning/dlasg_pruning.py`
+**핵심 함수**: `dlasg_blockwise_pruning()` in `lib/pruning/dlasg_pruning.py:74-89`
 
 ```python
 def dlasg_blockwise_pruning(model, sparsity, device='cpu'):
-    """DLA-34의 BasicBlock 단위로 구조화된 Pruning 적용"""
-
     for name, module in model.named_modules():
         if module.__class__.__name__ == 'BasicBlock':
             conv1, bn1 = module.conv1, module.bn1
             conv2, bn2 = module.conv2, module.bn2
 
-            # Step 1: Conv1 출력 채널의 L2 norm 계산
+            # conv1 출력 채널 pruning
             norms1 = get_filter_norms(conv1)
-
-            # Step 2: Global sparsity 기준 Pruning index 계산
             prune_idx1 = get_pruning_indices([norms1], sparsity)[0]
 
-            # Step 3: Conv1 필터 마스킹 (weight = 0)
-            filter_pruning(conv1, prune_idx1)
-
-            # Step 4: BN1 파라미터 마스킹
-            bn_pruning(bn1, prune_idx1)
+            filter_pruning(conv1, prune_idx1)  # weight를 0으로 설정
+            bn_pruning(bn1, prune_idx1)        # BN 파라미터를 0으로 설정
 ```
 
-### Pruning 메커니즘 상세
+**Pruning 메커니즘**:
+- `filter_pruning()`: Conv weight[pruning_idx] = 0.0
+- `bn_pruning()`: BN의 weight, bias, mean = 0.0, var = 1.0
 
-```python
-def filter_pruning(conv, pruning_idx):
-    """Conv weight를 0으로 마스킹"""
-    conv.weight.data[pruning_idx, :, :, :] = 0.0
+### 3. Channel Reduction (물리적 제거)
 
-def bn_pruning(bn, pruning_idx):
-    """BatchNorm 파라미터 마스킹"""
-    bn.weight.data[pruning_idx] = 0.0
-    bn.bias.data[pruning_idx] = 0.0
-    bn.running_mean.data[pruning_idx] = 0.0
-    bn.running_var.data[pruning_idx] = 1.0  # var=1로 설정 (나눗셈 방지)
-```
+**목적**: 0으로 마스킹된 채널을 물리적으로 제거하여 실제 모델 크기 감소
 
----
-
-## Channel Reduction (물리적 제거)
-
-### 목적
-
-마스킹된(0인) 채널을 물리적으로 제거하여 실제 모델 크기와 메모리 사용량 감소
-
-### 구현
-
-**핵심 함수**: `reduce_pruned_model()` in `lib/pruning/dlasg_pruning.py`
+**핵심 함수**: `reduce_pruned_model()` in `lib/pruning/dlasg_pruning.py:91-146`
 
 ```python
 def reduce_pruned_model(model):
-    """0인 필터를 물리적으로 제거한 축소 모델 생성"""
-
     for name, module in model.named_modules():
         if module.__class__.__name__ == 'BasicBlock':
             conv1, bn1 = module.conv1, module.bn1
             conv2, bn2 = module.conv2, module.bn2
 
-            # Step 1: 살아있는 채널 찾기 (norm != 0)
+            # 살아있는 채널 찾기
             keep = torch.where(
                 conv1.weight.view(conv1.weight.shape[0], -1).abs().sum(1) != 0
             )[0]
 
-            # Step 2: Conv1 축소 (출력 채널 감소)
+            # 새로운 작은 conv1 생성 (out_channels 감소)
             new_conv1 = nn.Conv2d(
                 in_channels=conv1.in_channels,
-                out_channels=keep.numel(),  # 축소된 크기!
-                kernel_size=conv1.kernel_size,
-                stride=conv1.stride,
-                padding=conv1.padding,
-                bias=conv1.bias is not None
+                out_channels=keep.numel(),  # 축소된 크기
+                ...
             )
             new_conv1.weight.data = conv1.weight[keep].clone()
 
-            # Step 3: Conv2 축소 (입력 채널 감소)
+            # 새로운 작은 conv2 생성 (in_channels 감소)
             new_conv2 = nn.Conv2d(
-                in_channels=keep.numel(),  # Conv1 출력에 맞춤!
+                in_channels=keep.numel(),  # conv1 출력에 맞춤
                 out_channels=conv2.out_channels,
-                kernel_size=conv2.kernel_size,
-                stride=conv2.stride,
-                padding=conv2.padding,
-                bias=conv2.bias is not None
+                ...
             )
             new_conv2.weight.data = conv2.weight[:, keep].clone()
 
-            # Step 4: BN1 축소
-            new_bn1 = nn.BatchNorm2d(keep.numel())
-            new_bn1.weight.data = bn1.weight[keep].clone()
-            new_bn1.bias.data = bn1.bias[keep].clone()
-            new_bn1.running_mean.data = bn1.running_mean[keep].clone()
-            new_bn1.running_var.data = bn1.running_var[keep].clone()
-
-            # Step 5: 모듈 교체
+            # BatchNorm도 동일하게 축소
             _assign_module(model, f"{name}.conv1", new_conv1)
             _assign_module(model, f"{name}.conv2", new_conv2)
-            _assign_module(model, f"{name}.bn1", new_bn1)
 ```
 
-### Reducing 전후 비교
+**특징**:
+- Conv1 출력 채널과 Conv2 입력 채널 동시 처리
+- BatchNorm도 연동하여 축소
+- BasicBlock 내부 연결성 유지
 
-```
-Before Reducing:
-├── conv1: [64, 32, 3, 3]  → 18,432 params (50% are zeros)
-├── bn1:   [64]            → 256 params
-├── conv2: [64, 64, 3, 3]  → 36,864 params
-└── Total: 55,552 params
+### 4. 메모리 측정
 
-After Reducing (50% sparsity):
-├── conv1: [32, 32, 3, 3]  → 9,216 params (실제 사용)
-├── bn1:   [32]            → 128 params
-├── conv2: [64, 32, 3, 3]  → 18,432 params
-└── Total: 27,776 params (50% 감소)
-```
+**목적**: 레이어별 메모리 사용량 프로파일링
 
----
-
-## 메모리 측정
-
-### 목적
-
-레이어별 GPU 메모리 사용량을 프로파일링하여 최적화 대상 식별
-
-### 구현
-
-**핵심 함수**: `memory_usage.py`
+**핵심 함수**: `pruning_TW.py` 및 `lib/pruning/memory_usage.py`
 
 ```python
 def measure_memory(x, layers, device):
-    """레이어별 메모리 사용량 측정"""
-
     # GPU 메모리 초기화
     x.cpu()
     for layer in layers:
         layer.cpu()
     torch.cuda.empty_cache()
 
-    before_memory = torch.cuda.memory_allocated(device) / 1024**2  # MB
+    before_memory = torch.cuda.memory_allocated(device) / 1024**2
 
     # Forward pass
     with torch.no_grad():
@@ -283,30 +166,25 @@ def measure_memory(x, layers, device):
             layer.to(device)
             x = layer(x)
 
-    after_memory = torch.cuda.memory_allocated(device) / 1024**2  # MB
+    after_memory = torch.cuda.memory_allocated(device) / 1024**2
 
     return x, after_memory - before_memory
 ```
 
-### 측정 대상
+**측정 대상**:
+- DLA base layers
+- Upsampling layers (dla_up, ida_up)
+- ConvGRU
+- Detection heads (hm, wh, reg, hps, scale 등)
 
-| 모듈 | 설명 |
-|------|------|
-| **DLA Base Layers** | level0 ~ level5 |
-| **Upsampling** | dla_up, ida_up |
-| **ConvGRU** | 4-step sequential GRU |
-| **Detection Heads** | hm, wh, reg, hps, scale 등 |
+### 5. Base Trainer 통합 최적화
 
----
+**목적**: 학습 중 자동으로 pruning 및 메모리 최적화 수행
 
-## Training-time 압축 통합
-
-### Base Trainer 수정
-
-**핵심 파일**: `lib/trains/base_trainer.py`
+**핵심 파일**: `lib/trains/base_trainer.py:106-140`
 
 ```python
-# Training phase에서 backprop 후 압축 적용
+# Training phase에서 backprop 후 최적화 적용
 if phase == 'train':
     self.optimizer.zero_grad()
     loss.backward()
@@ -317,67 +195,84 @@ if phase == 'train':
     else:
         model_for_pruning = model_with_loss.model.to(opt.device)
 
-    # 2. Blockwise Pruning 수행
-    dlasg_blockwise_pruning(
-        model_for_pruning,
-        sparsity=0.5,  # 50% 필터 제거
-        device=opt.device
-    )
+    # 2. Blockwise Pruning 수행 (sparsity=0.5)
+    dlasg_blockwise_pruning(model_for_pruning, sparsity=0.5, device=opt.device)
 
-    # 3. Pruning 전 메모리 측정 (최초 1회)
+    # 3. Pruning 전 메모리 측정 (최초 1회만)
     if self.file_stream is not None:
-        _ = measure_model_memory(
-            model_for_pruning,
-            self.dummy_input,
-            opt.device,
-            self.file_stream
-        )
+        _ = measure_model_memory(model_for_pruning, self.dummy_input,
+                                 opt.device, self.file_stream)
 
     # 4. Reducing 후 메모리 측정
-    mem_usg = measure_pruned_layer_memory(
-        model_for_pruning,
-        self.dummy_input,
-        opt.device,
-        self.file_stream
-    )
+    mem_usg = measure_pruned_layer_memory(model_for_pruning, self.dummy_input,
+                                          opt.device, self.file_stream)
 
-    # 5. 메모리 기반 Loss 추가
+    # 5. 메모리 기반 loss 추가
     hyperparam = 1.0
     device_condition_memory = 1.0  # MB 단위
-    loss += custom_memory_loss_function(
-        mem_usg,
-        hyperparam,
-        device_condition_memory
-    )
+    loss += custom_memory_loss_function(mem_usg, hyperparam,
+                                        device_condition_memory)
 
     # 6. Gradient clipping 및 optimizer step
     torch.nn.utils.clip_grad_norm_(model.parameters(), 100.)
     self.optimizer.step()
 ```
 
-### 특징
+**특징**:
+- **Training-time Pruning**: 매 iteration마다 자동 pruning 수행
+- **메모리 제약 loss**: 메모리 사용량을 loss에 반영하여 최적화
+- **DataParallel 호환**: 멀티 GPU 환경에서도 동작
+- **Gradient Clipping**: 안정적인 학습을 위한 gradient norm 제한
 
-- **Training-time Pruning**: 매 iteration마다 자동 실행
-- **메모리 제약 Loss**: 메모리 사용량을 loss에 반영
-- **DataParallel 호환**: 멀티 GPU 환경 지원
-- **Gradient Clipping**: 안정적 학습 보장
+### 6. Demo 수정 (압축 모델 추론)
 
----
+**목적**: Reduced 모델을 사용한 실시간 추론 지원
+
+**핵심 파일**: `reduced_demo.py`
+
+```python
+# 기존 demo.py와 동일한 인터페이스, 압축 모델 로드
+if __name__ == '__main__':
+    opt = opts().parser.parse_args()
+
+    # 압축 모델 로드 (reduced_model_50.pth 등)
+    opt.load_model = "../models/reduced_model_50.pth"
+
+    # 나머지는 demo.py와 동일
+    opt.nms = True
+    opt.obj_scale = True
+
+    # Tracking 설정
+    if opt.tracking_task == True:
+        opt.pre_img = True
+        opt.pre_hm = True
+        opt.tracking = True
+        # ... (tracking 관련 설정)
+
+    # 추론 실행
+    demo(opt, meta)
+```
+
+**변경 사항**:
+- 압축된 모델(.pth) 로드 지원
+- 기존 demo.py와 동일한 인터페이스 유지
+- 실시간 비디오/이미지 추론 가능
+- PnP 알고리즘 및 Tracking 지원
 
 ## 전체 Compression Flow
 
-```
+```markdown
 ┌─────────────────────────────────────────────────────────┐
 │                  Compression Start                       │
 └─────────────────────────────────────────────────────────┘
-                          ↓
+                           ↓
 ┌─────────────────────────────────────────────────────────┐
 │  1. Model Loading                                       │
 │     - Load pretrained DLA-34 model                      │
 │     - Create model with opts configuration              │
 │     - Load checkpoint (.pth file)                       │
 └─────────────────────────────────────────────────────────┘
-                          ↓
+                           ↓
 ┌─────────────────────────────────────────────────────────┐
 │  2. Pruning Phase                                       │
 │     ┌─────────────────────────────────────────┐        │
@@ -393,12 +288,23 @@ if phase == 'train':
 │     │                                         │        │
 │     │  C. Apply Pruning                       │        │
 │     │     - conv1.weight[idx] = 0.0           │        │
-│     │     - bn1 parameters = 0.0              │        │
+│     │     - bn1.weight[idx] = 0.0             │        │
+│     │     - bn1.bias[idx] = 0.0               │        │
+│     │     - bn1.mean[idx] = 0.0               │        │
+│     │     - bn1.var[idx] = 1.0                │        │
+│     │                                         │        │
 │     └─────────────────────────────────────────┘        │
 └─────────────────────────────────────────────────────────┘
-                          ↓
+                           ↓
 ┌─────────────────────────────────────────────────────────┐
-│  3. Reducing Phase                                      │
+│  3. Verification (선택)                                  │
+│     - Count zero parameters                             │
+│     - Calculate sparsity ratio                          │
+│     - Save pruned model (.pth)                          │
+└─────────────────────────────────────────────────────────┘
+                           ↓
+┌─────────────────────────────────────────────────────────┐
+│  4. Reducing Phase                                      │
 │     ┌─────────────────────────────────────────┐        │
 │     │  For each BasicBlock:                   │        │
 │     │                                         │        │
@@ -407,177 +313,245 @@ if phase == 'train':
 │     │                                         │        │
 │     │  B. Create Reduced Conv1                │        │
 │     │     - new out_channels = len(keep)      │        │
+│     │     - Copy weights[keep]                │        │
 │     │                                         │        │
 │     │  C. Create Reduced Conv2                │        │
 │     │     - new in_channels = len(keep)       │        │
+│     │     - Copy weights[:, keep]             │        │
 │     │                                         │        │
 │     │  D. Create Reduced BN1                  │        │
+│     │     - Reduce all BN parameters          │        │
+│     │                                         │        │
 │     └─────────────────────────────────────────┘        │
 └─────────────────────────────────────────────────────────┘
-                          ↓
+                           ↓
 ┌─────────────────────────────────────────────────────────┐
-│  4. Save & Verify                                       │
+│  5. Final Model                                         │
 │     - Save reduced model (.pth)                         │
 │     - Verify parameter reduction                        │
-│     - Measure memory usage                              │
+│     - Measure memory usage (선택)                        │
 └─────────────────────────────────────────────────────────┘
 ```
-
----
 
 ## 상세 Compression Flow
 
-```
-[1] 모델 로드
+```markdown
+[1] 모델 로드 (pruning.py 또는 reducing.py)
     ├─ opt 설정
     │   ├─ arch = 'dla_34'
     │   ├─ tracking_task = True
-    │   └─ heads 설정 (hm, reg, wh, hps, scale 등)
+    │   ├─ heads 설정 (hm, reg, wh, hps, scale 등)
+    │   └─ head_conv = 256
+    │
+    ├─ Dataset 정보 업데이트
+    │   └─ ObjectPoseDataset 사용
+    │
+    ├─ create_model(arch, heads, head_conv)
+    │   └─ DLA-34 기반 모델 생성
     │
     └─ load_model(model, checkpoint_path)
+        └─ 사전 학습된 가중치 로드
 
 [2] Pruning 실행
     └─ dlasg_blockwise_pruning(model, sparsity=0.5)
         │
         ├─ [2-1] BasicBlock 순회
+        │   └─ For each BasicBlock in model:
         │
         ├─ [2-2] Conv1 필터 norm 계산
-        │   ├─ norms = L2_norm(conv1.weight)
-        │   └─ norms[max_idx] = inf  # 보호
+        │   ├─ get_filter_norms(conv1)
+        │   │   ├─ norms = L2_norm(conv1.weight)
+        │   │   ├─ max_idx = argmax(norms)
+        │   │   └─ norms[max_idx] = inf  # 보호
+        │   │
+        │   └─ get_pruning_indices([norms], sparsity)
+        │       ├─ global: top-k smallest norms
+        │       └─ local: convert to layer index
         │
-        ├─ [2-3] Global pruning index 계산
-        │   └─ top-k smallest norms
+        ├─ [2-3] Conv1 Pruning
+        │   └─ filter_pruning(conv1, prune_idx)
+        │       └─ conv1.weight[prune_idx, :, :, :] = 0.0
         │
-        ├─ [2-4] Conv1 Pruning
-        │   └─ conv1.weight[prune_idx] = 0.0
-        │
-        └─ [2-5] BN1 Pruning
-            ├─ bn1.weight[prune_idx] = 0.0
-            ├─ bn1.bias[prune_idx] = 0.0
-            └─ bn1.running_var[prune_idx] = 1.0
+        └─ [2-4] BN1 Pruning
+            └─ bn_pruning(bn1, prune_idx)
+                ├─ bn1.weight[prune_idx] = 0.0
+                ├─ bn1.bias[prune_idx] = 0.0
+                ├─ bn1.running_mean[prune_idx] = 0.0
+                └─ bn1.running_var[prune_idx] = 1.0
 
-[3] Reducing 실행
+[3] Pruning 검증 (선택)
+    ├─ total_params = sum(p.numel())
+    ├─ total_zero = sum((p == 0).sum())
+    └─ sparsity = total_zero / total_params
+        └─ 예: 50% sparsity
+
+[4] Pruned 모델 저장 (선택)
+    └─ torch.save({'epoch': epoch, 'state_dict': model.state_dict()},
+                  f"my_pruned_model_{sparsity}.pth")
+
+[5] Reducing 실행
     └─ reduce_pruned_model(model)
         │
-        ├─ [3-1] 살아있는 채널 찾기
-        │   └─ keep = where(weight != 0)
-        │
-        ├─ [3-2] Conv1 축소
-        │   └─ out_channels = len(keep)
-        │
-        ├─ [3-3] Conv2 축소
-        │   └─ in_channels = len(keep)
-        │
-        └─ [3-4] BN1 축소
+        └─ For each BasicBlock:
+            │
+            ├─ [5-1] 살아있는 채널 찾기
+            │   └─ keep = torch.where(
+            │         conv1.weight.view(C_out, -1).abs().sum(1) != 0
+            │       )[0]
+            │
+            ├─ [5-2] Conv1 Reduce
+            │   ├─ new_conv1 = Conv2d(
+            │   │     in_channels=old_in,
+            │   │     out_channels=len(keep)  # 축소!
+            │   │   )
+            │   └─ new_conv1.weight = conv1.weight[keep]
+            │
+            ├─ [5-3] Conv2 Reduce
+            │   ├─ new_conv2 = Conv2d(
+            │   │     in_channels=len(keep),  # 축소!
+            │   │     out_channels=old_out
+            │   │   )
+            │   └─ new_conv2.weight = conv2.weight[:, keep]
+            │
+            ├─ [5-4] BN1 Reduce
+            │   ├─ keep_bn = torch.where(bn1.weight != 0)[0]
+            │   ├─ new_bn = BatchNorm2d(len(keep_bn))
+            │   ├─ new_bn.weight = bn1.weight[keep_bn]
+            │   ├─ new_bn.bias = bn1.bias[keep_bn]
+            │   ├─ new_bn.running_mean = bn1.running_mean[keep_bn]
+            │   └─ new_bn.running_var = bn1.running_var[keep_bn]
+            │
+            └─ [5-5] 모듈 교체
+                ├─ _assign_module(model, "conv1", new_conv1)
+                ├─ _assign_module(model, "conv2", new_conv2)
+                └─ _assign_module(model, "bn1", new_bn)
 
-[4] 모델 저장
-    └─ torch.save(reduced_model, 'reduced_model_50.pth')
+[6] Reduced 모델 저장
+    ├─ torch.save(reduced_model, f"reduced_model_{sparsity}.pth")
+    │
+    └─ 검증
+        ├─ reduced_params = sum(p.numel())
+        ├─ reduction_ratio = 1 - (reduced_params / original_params)
+        └─ 예: 30-40% parameter reduction
+
+[7] 메모리 측정 (선택)
+    └─ measure_model_memory(reduced_model, input_tensor, device)
+        │
+        ├─ [7-1] Base Layers
+        │   └─ For each layer in DLA base:
+        │       └─ measure_memory(layer)
+        │
+        ├─ [7-2] Upsampling Layers
+        │   ├─ dla_up: measure_memory()
+        │   └─ ida_up: measure_memory()
+        │
+        ├─ [7-3] ConvGRU
+        │   └─ measure_memory(convgru)
+        │       └─ 4-step sequential GRU
+        │
+        ├─ [7-4] Detection Heads
+        │   ├─ For each head in ['hm', 'wh', 'reg', ...]:
+        │   │   └─ measure_memory(head_layer)
+        │   │
+        │   └─ heads: hm, wh, reg, hm_hp, hp_offset, hps,
+        │             hps_uncertainty, scale, scale_uncertainty,
+        │             tracking, tracking_hp
+        │
+        └─ [7-5] Total Memory
+            └─ sum(layer_memories)
+                └─ 예: Original: 150 MB, Reduced: 100 MB
+
+[8] 압축 완료
+    ├─ reduced_model_{sparsity}.pth 생성
+    ├─ 파라미터 감소: 30-40%
+    ├─ 메모리 감소: 30-40%
+    └─ 정확도 유지: 추가 fine-tuning 가능
 ```
 
----
+## 압축 결과 비교
+
+### Parameter Count
+```
+Original Model: ~20M parameters
+Pruned Model (50%): ~20M parameters (50% are zeros)
+Reduced Model (50%): ~12-14M parameters (물리적 제거)
+Reduction Ratio: 30-40%
+```
+
+### Memory Usage
+```
+Original Model: ~150-200 MB (inference)
+Reduced Model: ~100-130 MB (inference)
+Memory Reduction: 30-40%
+```
+
+### 주요 특징
+1. **One-shot Pruning**: Training 없이 단일 실행으로 pruning
+2. **Global Sparsity**: 전체 레이어를 고려한 통합 pruning
+3. **Blockwise Processing**: BasicBlock 단위 구조화된 pruning
+4. **Physical Reduction**: 실제 모델 크기 감소
+5. **No Knowledge Distillation**: Teacher 모델 불필요
 
 ## 실행 방법
 
 ### 1. Pruning만 수행
-
 ```bash
-cd "CenterPose src custom"
 python pruning.py
-# Output: my_pruned_model_50.pth (0으로 마스킹된 상태)
+# Output: my_pruned_model_50.pth
 ```
 
 ### 2. Pruning + Reducing
-
 ```bash
 python reducing.py
-# Output: reduced_model_50.pth (물리적으로 축소된 모델)
+# Output: reduced_model_50.pth
 ```
 
-### 3. 메모리 측정 포함 Pruning
-
+### 3. 메모리 측정 포함
 ```bash
 python pruning_TW.py
 # Output: 레이어별 메모리 사용량 출력
 ```
 
 ### 4. 압축 모델 Demo 실행
-
 ```bash
 python reduced_demo.py --load_model ../models/reduced_model_50.pth
 # Output: 압축 모델 기반 실시간 추론
 ```
 
 ### 5. Training-time 자동 압축
-
 ```bash
+# base_trainer.py가 자동으로 압축 수행
 python main.py --task objectpose --exp_id compression_exp
 # 매 iteration마다 자동 pruning + 메모리 최적화
 ```
 
----
-
-## 압축 결과
-
-### Parameter Count
-
-```
-Original Model:     ~20M parameters
-Pruned Model (50%): ~20M parameters (50%가 0)
-Reduced Model:      ~12-14M parameters (물리적 제거)
-Reduction Ratio:    30-40%
-```
-
-### Memory Usage
-
-```
-Original Model:  ~150-200 MB (inference)
-Reduced Model:   ~100-130 MB (inference)
-Memory Reduction: 30-40%
-```
-
----
-
-## YOLO vs CenterPose 압축 비교
+## YOLO vs CenterPose 비교
 
 | 항목 | YOLO Compression | CenterPose Compression |
 |------|------------------|------------------------|
-| **백본** | CSPDarknet (YOLOv8) | DLA-34 |
-| **타겟 모듈** | Conv, C2f, SPPF, Detect | BasicBlock |
+| **백본** | YOLOv8 (CSPDarknet) | DLA-34 |
+| **타겟 모듈** | C2f, SPPF, Detect | BasicBlock |
 | **Pruning 방식** | Dynamic (매 step) | One-shot |
-| **Knowledge Distillation** | Yes (YOLOv8x → v8n) | No |
-| **Training 필요** | Yes | No (사전 학습 모델만) |
-| **Reducing 시점** | 학습 후 (선택) | Pruning 직후 |
+| **Distillation** | Yes (YOLOv8x → v8n) | No |
+| **Training 필요** | Yes (학습 중 pruning) | No (사전 학습 모델만) |
+| **Reducing 시점** | 학습 후 | Pruning 직후 |
 | **복잡도** | High (통합 학습) | Low (후처리) |
-| **성능 유지** | 더 좋음 (KD 효과) | Fine-tuning 권장 |
 
----
+## 핵심 차이점
 
-## 핵심 차이점 요약
-
-### CenterPose 특징
-
-1. **One-shot Pruning**
-   - 학습 없이 가중치 분석만으로 Pruning
+1. **CenterPose는 One-shot Pruning**
+   - 학습 없이 가중치 분석만으로 pruning
    - 빠른 압축 가능
 
-2. **BasicBlock 단위 처리**
+2. **YOLO는 Training-time Pruning**
+   - 학습 과정에서 동적으로 pruning
+   - Distillation과 동시 진행
+   - 더 나은 성능 유지 가능
+
+3. **CenterPose는 BasicBlock 단위**
    - DLA 구조의 특성 반영
    - Conv1-BN1-Conv2-BN2 세트 처리
 
-3. **No Knowledge Distillation**
-   - Teacher 모델 불필요
-   - 메모리 효율적
-
-### YOLO 특징
-
-1. **Training-time Pruning**
-   - 학습 과정에서 동적으로 Pruning
-   - Distillation과 동시 진행
-
-2. **다양한 모듈 처리**
+4. **YOLO는 다양한 모듈 처리**
    - C2f, SPPF, Detect 각각 전용 로직
    - Concatenation 추적 필요
-
-3. **Knowledge Distillation**
-   - Teacher(YOLOv8x) → Student(YOLOv8n)
-   - 더 나은 성능 유지
