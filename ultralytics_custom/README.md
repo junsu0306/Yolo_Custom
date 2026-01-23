@@ -1,8 +1,10 @@
-# YOLO Compression 상세 문서
+# YOLO Compression (ultralytics_custom)
+
+YOLOv8 모델에 대한 **Knowledge Distillation + Structured Pruning** 기반 Training-time 압축 구현입니다.
+
+---
 
 ## 개요
-
-YOLOv8 모델 압축 프로젝트로, **Knowledge Distillation**과 **Structured Pruning**을 결합한 Training-time 압축 기법을 구현합니다.
 
 ### 핵심 기술
 
@@ -116,6 +118,20 @@ def yolov8_pruning(model, sparsity, device='cuda'):
             # 필터 마스킹 (weight = 0)
             filter_pruning(block.conv, pruning_idx)
             bn_pruning(block.bn, pruning_idx)
+```
+
+**Pruning 메커니즘**:
+```python
+def filter_pruning(conv, pruning_idx):
+    """Conv weight를 0으로 마스킹"""
+    conv.weight.data[pruning_idx, :, :, :] = 0.0
+
+def bn_pruning(bn, pruning_idx):
+    """BatchNorm 파라미터 마스킹"""
+    bn.weight.data[pruning_idx] = 0.0
+    bn.bias.data[pruning_idx] = 0.0
+    bn.running_mean.data[pruning_idx] = 0.0
+    bn.running_var.data[pruning_idx] = 1.0  # var=1로 설정 (나눗셈 방지)
 ```
 
 **특징**:
@@ -360,3 +376,297 @@ torch.save(reduced_model.state_dict(), 'compressed_yolov8n.pt')
 | **Training 필요** | Yes | No |
 | **복잡도** | High | Low |
 | **성능 유지** | 더 좋음 (KD 효과) | Fine-tuning 필요 |
+
+---
+
+## 실제 실행 가이드 (Step-by-Step)
+
+이 섹션에서는 **처음부터 끝까지** YOLO 모델 압축을 진행하고 실제로 사용하는 전체 과정을 설명합니다.
+
+### 사전 요구사항
+
+```bash
+# Python 3.8+ 및 PyTorch 1.10+ 필요
+pip install torch torchvision
+pip install opencv-python numpy pillow
+```
+
+### Step 1: 원본 Ultralytics 레포지토리 클론
+
+```bash
+# Ultralytics 원본 레포지토리 클론
+git clone https://github.com/ultralytics/ultralytics.git
+cd ultralytics
+
+# 의존성 설치
+pip install -e .
+```
+
+### Step 2: Custom 압축 파일 적용
+
+```bash
+# Custom 파일들을 Ultralytics에 복사
+# (Yolo_Custom 프로젝트 루트에서 실행)
+
+# 방법 1: 전체 ultralytics_custom 폴더 사용 (권장)
+# ultralytics_custom을 별도로 사용하고 import 경로만 수정
+
+# 방법 2: 개별 파일 복사
+cp ultralytics_custom/engine/trainer.py ultralytics/ultralytics/engine/
+cp ultralytics_custom/engine/compression.py ultralytics/ultralytics/engine/
+cp -r ultralytics_custom/engine/compression_src ultralytics/ultralytics/engine/
+cp ultralytics_custom/cfg/default.yaml ultralytics/ultralytics/cfg/
+cp ultralytics_custom/utils/memory_usage_MH.py ultralytics/ultralytics/utils/
+```
+
+### Step 3: 데이터셋 준비
+
+```bash
+# COCO 데이터셋 다운로드 (또는 커스텀 데이터셋)
+# Ultralytics는 자동으로 coco8.yaml 샘플 데이터를 다운로드
+
+# 커스텀 데이터셋 사용 시 data.yaml 파일 생성
+# data.yaml 예시:
+# path: /path/to/dataset
+# train: images/train
+# val: images/val
+# names:
+#   0: class1
+#   1: class2
+```
+
+### Step 4: 압축 학습 실행 (Pruning + Knowledge Distillation)
+
+```python
+# train_compressed.py
+from ultralytics import YOLO
+
+# Student 모델 로드
+model = YOLO('yolov8n.pt')
+
+# 압축 학습 실행
+# - pruning_ratio: 제거할 필터 비율 (0.3 = 30%)
+# - mem_usg: 목표 메모리 사용량 (MB)
+results = model.train(
+    data='coco8.yaml',      # 데이터셋
+    epochs=100,             # 학습 에폭
+    imgsz=640,              # 이미지 크기
+    batch=16,               # 배치 크기
+    pruning_ratio=0.3,      # 30% pruning
+    mem_usg=100.0,          # 메모리 제약 (MB)
+    device=0                # GPU 번호
+)
+```
+
+**실행:**
+```bash
+python train_compressed.py
+```
+
+**또는 CLI로 실행:**
+```bash
+yolo detect train \
+    model=yolov8n.pt \
+    data=coco8.yaml \
+    epochs=100 \
+    pruning_ratio=0.3 \
+    mem_usg=100.0
+```
+
+### Step 5: 학습 후 Reducing (물리적 채널 제거)
+
+학습이 완료되면 Pruning된 모델(0으로 마스킹된 필터)을 물리적으로 축소합니다.
+
+```python
+# reduce_model.py
+import torch
+from ultralytics import YOLO
+from ultralytics.engine.compression import yolov8_pruning, yolov8_reducing
+
+# 1. 학습된 모델 로드
+model = YOLO('runs/detect/train/weights/best.pt')
+
+# 2. 새로운 빈 모델 생성 (reducing 대상)
+reduced_model = YOLO('yolov8n.yaml')  # 구조만 로드
+
+# 3. Reducing 실행
+yolov8_reducing(
+    model=model.model.model,           # 원본 (pruned) 모델
+    reduced_model=reduced_model.model.model  # 축소될 모델
+)
+
+# 4. 저장
+torch.save(reduced_model.model.state_dict(), 'compressed_yolov8n.pt')
+print("Compressed model saved!")
+
+# 5. 파라미터 수 비교
+original_params = sum(p.numel() for p in model.model.parameters())
+reduced_params = sum(p.numel() for p in reduced_model.model.parameters())
+print(f"Original: {original_params:,} params")
+print(f"Reduced:  {reduced_params:,} params")
+print(f"Reduction: {(1 - reduced_params/original_params)*100:.1f}%")
+```
+
+### Step 6: 압축된 모델로 추론 실행
+
+```python
+# inference.py
+from ultralytics import YOLO
+
+# 압축된 모델 로드
+model = YOLO('runs/detect/train/weights/best.pt')
+
+# 이미지 추론
+results = model.predict(
+    source='path/to/image.jpg',
+    save=True,
+    conf=0.25
+)
+
+# 결과 확인
+for result in results:
+    print(result.boxes)  # 바운딩 박스
+    print(result.names)  # 클래스 이름
+```
+
+**CLI로 추론:**
+```bash
+# 이미지
+yolo detect predict model=runs/detect/train/weights/best.pt source=image.jpg
+
+# 비디오
+yolo detect predict model=runs/detect/train/weights/best.pt source=video.mp4
+
+# 웹캠
+yolo detect predict model=runs/detect/train/weights/best.pt source=0
+
+# 폴더 내 모든 이미지
+yolo detect predict model=runs/detect/train/weights/best.pt source=images/
+```
+
+### Step 7: 모델 내보내기 (Export)
+
+```python
+from ultralytics import YOLO
+
+model = YOLO('runs/detect/train/weights/best.pt')
+
+# ONNX 내보내기
+model.export(format='onnx')
+
+# TensorRT 내보내기 (NVIDIA GPU)
+model.export(format='engine')
+
+# CoreML 내보내기 (Apple)
+model.export(format='coreml')
+
+# TFLite 내보내기 (모바일)
+model.export(format='tflite')
+```
+
+### Step 8: 성능 평가
+
+```python
+from ultralytics import YOLO
+
+# 모델 로드
+model = YOLO('runs/detect/train/weights/best.pt')
+
+# Validation 실행
+metrics = model.val(data='coco8.yaml')
+
+print(f"mAP50: {metrics.box.map50:.3f}")
+print(f"mAP50-95: {metrics.box.map:.3f}")
+print(f"Precision: {metrics.box.p:.3f}")
+print(f"Recall: {metrics.box.r:.3f}")
+```
+
+---
+
+## 전체 실행 흐름 요약
+
+```
+[1] 환경 준비
+    └── Ultralytics 원본 클론 + pip install -e .
+            ↓
+[2] Custom 파일 적용
+    └── engine/trainer.py, compression.py, cfg/default.yaml 복사
+            ↓
+[3] 데이터셋 준비
+    └── COCO 또는 커스텀 데이터셋
+            ↓
+[4] 압축 학습 실행
+    └── model.train(pruning_ratio=0.3, mem_usg=100.0)
+    └── 출력: runs/detect/train/weights/best.pt
+            ↓
+[5] (선택) Reducing 실행
+    └── yolov8_reducing(model, reduced_model)
+    └── 출력: compressed_yolov8n.pt
+            ↓
+[6] 추론 실행
+    └── model.predict(source='image.jpg')
+            ↓
+[7] 모델 내보내기
+    └── model.export(format='onnx')
+            ↓
+[8] 성능 평가
+    └── model.val(data='coco8.yaml')
+```
+
+---
+
+## 주요 파라미터 설명
+
+### cfg/default.yaml 압축 파라미터
+
+```yaml
+pruning_ratio: 0.3    # Pruning 비율 (0.0 = 비활성화)
+                      # 0.3 = 30% 필터 제거
+                      # 권장: 0.2 ~ 0.5
+
+mem_usg: 100.0        # 목표 메모리 사용량 (MB)
+                      # 0.0 = 메모리 제약 비활성화
+                      # 초과 시 Memory Loss 추가
+```
+
+### Knowledge Distillation 설정
+
+현재 `trainer.py`에서 하드코딩되어 있습니다:
+- **Teacher**: `yolov8x/best.pt` (사전 학습 필요)
+- **Student**: 학습 대상 모델
+
+Teacher 모델 경로 수정 시 `trainer.py` Line 264-272 참조:
+```python
+# Teacher 모델 로드 예시
+self.teacher_model = YOLO('path/to/teacher/best.pt')
+for param in self.teacher_model.model.parameters():
+    param.requires_grad = False
+self.teacher_model.model.half()  # FP16 변환
+```
+
+---
+
+## 주의사항
+
+### 1. Teacher 모델 준비
+- Knowledge Distillation 사용 시 Teacher 모델 사전 학습 필요
+- YOLOv8x 권장 (더 큰 모델 = 더 좋은 Teacher)
+
+### 2. GPU 메모리
+- Teacher + Student 동시 로드로 메모리 사용량 증가
+- 최소 8GB GPU 메모리 권장
+- 메모리 부족 시 `batch` 크기 줄이기
+
+### 3. 학습 시간
+- Pruning + Distillation으로 일반 학습 대비 시간 증가
+- 매 step마다 Teacher forward pass 추가
+
+### 4. Reducing 주의점
+- Reducing은 학습 완료 후 1회만 실행
+- Concatenation 레이어 (indices: 11, 14, 17, 20) 특별 처리 필요
+- Reducing 후 추가 Fine-tuning 권장
+
+### 5. 성능 저하 대응
+- pruning_ratio를 낮춰서 (0.2~0.3) 재시도
+- 학습 에폭 증가
+- Learning rate 조정

@@ -1,8 +1,10 @@
-# CenterPose Compression 상세 문서
+# CenterPose Compression
+
+DLA-34 기반 CenterPose 6D Pose Estimation 모델에 대한 **One-shot Structured Pruning** 구현입니다.
+
+---
 
 ## 개요
-
-CenterPose 6D Pose Estimation 모델 압축 프로젝트로, DLA-34 백본에 대한 **One-shot Structured Pruning**과 **Channel Reduction** 기법을 구현합니다.
 
 ### 핵심 기술
 
@@ -581,3 +583,214 @@ Memory Reduction: 30-40%
 3. **Knowledge Distillation**
    - Teacher(YOLOv8x) → Student(YOLOv8n)
    - 더 나은 성능 유지
+
+---
+
+## 실제 실행 가이드 (Step-by-Step)
+
+이 섹션에서는 **처음부터 끝까지** 압축을 진행하고 실제로 사용하는 전체 과정을 설명합니다.
+
+### 사전 요구사항
+
+```bash
+# Python 3.8+ 및 PyTorch 1.10+ 필요
+pip install torch torchvision
+pip install opencv-python numpy
+```
+
+### Step 1: 원본 CenterPose 레포지토리 클론
+
+```bash
+# CenterPose 원본 레포지토리 클론
+git clone https://github.com/NVlabs/CenterPose.git
+cd CenterPose
+
+# 의존성 설치
+pip install -r requirements.txt
+
+# DCNv2 빌드 (필요한 경우)
+cd src/lib/models/networks/DCNv2
+python setup.py build develop
+cd ../../../../..
+```
+
+### Step 2: Custom 압축 파일 적용
+
+```bash
+# Custom 파일들을 CenterPose에 복사
+# (Yolo_Custom 프로젝트 루트에서 실행)
+
+# 핵심 압축 모듈 복사
+cp "CenterPose src custom/lib/pruning/dlasg_pruning.py" CenterPose/src/lib/pruning/
+cp "CenterPose src custom/lib/pruning/memory_usage.py" CenterPose/src/lib/pruning/
+
+# 실행 스크립트 복사
+cp "CenterPose src custom/pruning.py" CenterPose/src/
+cp "CenterPose src custom/reducing.py" CenterPose/src/
+cp "CenterPose src custom/reduced_demo.py" CenterPose/src/
+
+# (선택) Training-time 압축을 사용할 경우
+cp "CenterPose src custom/lib/trains/base_trainer.py" CenterPose/src/lib/trains/
+```
+
+### Step 3: 사전 학습된 모델 준비
+
+```bash
+# CenterPose 사전 학습 모델 다운로드
+# https://github.com/NVlabs/CenterPose#pre-trained-models 참조
+
+# 예: shoe 카테고리 모델
+mkdir -p CenterPose/models/CenterPoseTrack
+# 다운로드한 .pth 파일을 models/ 폴더에 저장
+```
+
+### Step 4: Pruning 실행 (가중치 마스킹)
+
+```bash
+cd CenterPose/src
+
+# pruning.py 내 모델 경로 수정
+# model_path = "경로/to/your/model.pth"
+# sparsity = 0.50  # 50% 필터 제거
+
+python pruning.py
+```
+
+**pruning.py 수정 예시:**
+```python
+if __name__ == "__main__":
+    # 본인의 모델 경로로 수정
+    model_path = "../models/CenterPoseTrack/shoe_15.pth"
+    sparsity = 0.50  # 50% pruning
+    model = load_and_prune_model(model_path, sparsity)
+```
+
+**출력:**
+```
+Creating model...
+Loading model weights from ../models/CenterPoseTrack/shoe_15.pth...
+Applying pruning with sparsity 0.5...
+Pruned model weights saved as my_pruned_model_50.pth (epoch 15)
+```
+
+### Step 5: Reducing 실행 (물리적 채널 제거)
+
+```bash
+# reducing.py 내 모델 경로 수정 후 실행
+python reducing.py
+```
+
+**reducing.py 수정 예시:**
+```python
+if __name__ == "__main__":
+    os.environ["CUDA_VISIBLE_DEVICES"] = '0'
+    model_path = "../models/CenterPoseTrack/shoe_15.pth"  # 원본 모델
+    sparsity = 0.50
+    reduced_model = load_and_reduce_model(model_path, sparsity)
+```
+
+**출력:**
+```
+Total parameters: 20000000
+zero parameters: 10000000
+Reducing model with pruning threshold...
+Reduced model weights saved as reduced_model_50_shoe.pth (epoch 15)
+After reduce Total parameters: 12000000
+After reduce zero parameters: 0
+```
+
+### Step 6: 압축된 모델로 추론 실행
+
+```bash
+# 이미지/비디오에 대해 추론 실행
+python reduced_demo.py \
+    --load_model ../models/reduced_model_50_shoe.pth \
+    --demo ../images/test_shoe.jpg \
+    --arch dla_34 \
+    --c shoe \
+    --debug 2
+```
+
+**reduced_demo.py 사용법:**
+```bash
+# 단일 이미지
+python reduced_demo.py --load_model reduced_model_50.pth --demo image.jpg
+
+# 이미지 폴더
+python reduced_demo.py --load_model reduced_model_50.pth --demo ./images/
+
+# 비디오 파일
+python reduced_demo.py --load_model reduced_model_50.pth --demo video.mp4
+
+# 웹캠
+python reduced_demo.py --load_model reduced_model_50.pth --demo webcam
+```
+
+### Step 7: 압축 결과 확인
+
+```python
+import torch
+
+# 원본 모델 파라미터 수
+original = torch.load("original_model.pth")
+original_params = sum(p.numel() for p in original['state_dict'].values())
+
+# 압축 모델 파라미터 수
+reduced = torch.load("reduced_model_50.pth")
+reduced_params = sum(p.numel() for p in reduced.parameters())
+
+print(f"Original: {original_params:,} params")
+print(f"Reduced:  {reduced_params:,} params")
+print(f"Reduction: {(1 - reduced_params/original_params)*100:.1f}%")
+```
+
+---
+
+## 전체 실행 흐름 요약
+
+```
+[1] 환경 준비
+    └── CenterPose 원본 클론 + 의존성 설치
+            ↓
+[2] Custom 파일 적용
+    └── lib/pruning/, pruning.py, reducing.py 복사
+            ↓
+[3] 모델 준비
+    └── 사전 학습된 .pth 파일 다운로드
+            ↓
+[4] Pruning 실행
+    └── python pruning.py
+    └── 출력: my_pruned_model_50.pth (마스킹된 상태)
+            ↓
+[5] Reducing 실행
+    └── python reducing.py
+    └── 출력: reduced_model_50.pth (물리적 축소)
+            ↓
+[6] 추론 실행
+    └── python reduced_demo.py --load_model reduced_model_50.pth
+            ↓
+[7] 결과 확인
+    └── 파라미터 수, 메모리 사용량, 추론 속도 비교
+```
+
+---
+
+## 주의사항
+
+### 1. 모델 경로 수정 필수
+- `pruning.py`, `reducing.py` 내의 `model_path` 변수를 본인 환경에 맞게 수정
+
+### 2. GPU 메모리
+- Reducing 과정에서 GPU 메모리 필요 (최소 4GB 권장)
+- `os.environ["CUDA_VISIBLE_DEVICES"] = '0'`로 GPU 지정
+
+### 3. 카테고리 설정
+- `opt.c` 변수를 압축하려는 객체 카테고리로 설정
+- 지원: `shoe`, `chair`, `cup`, `camera`, `bike`, `book`, `bottle`, `cereal_box`, `laptop`, `mug`
+
+### 4. Tracking Task
+- CenterPoseTrack 모델 사용 시 `opt.tracking_task = True` 설정 필요
+
+### 5. 성능 저하 대응
+- 압축 후 성능 저하가 크면 Fine-tuning 권장
+- sparsity 값을 낮춰서 (0.3~0.4) 재시도
