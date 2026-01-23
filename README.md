@@ -27,7 +27,6 @@ On_Device_AI/
 │
 ├── ultralytics_custom/          # YOLO 원본 통합용 (trainer 등)
 ├── CenterPose src custom/       # CenterPose 원본 통합용
-└── analysis/                    # 기술 분석 문서
 ```
 
 ---
